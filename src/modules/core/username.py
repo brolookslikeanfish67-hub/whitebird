@@ -1,18 +1,10 @@
-import sys
-import os
-import time
-import aiohttp
-import asyncio
-
-from rich.live import Live
-from rich.console import Console
+import asyncio, os, sys, time, logging, aiohttp
+from pathlib import Path
+from rich.markup import escape
 from rich.text import Text
-from rich.panel import Panel
+from rich.live import Live
 
-sys.path.append(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "src"))
-)
-
+sys.path.append(str(Path(__file__).resolve().parents / "src"))
 from ..whatsmyname.list_operations import readList
 from ..utils.parse import extractMetadata, remove_duplicates
 from ..utils.filter import filterFoundAccounts, applyFilters
@@ -21,171 +13,82 @@ from ..utils.log import logError
 from ..export.dump import dumpContent
 from ..sites.instagram import get_instagram_account_info
 
-sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-
-
-# Verify account existence based on list args
-async def checkSite(
-    site,
-    method,
-    url,
-    session,
-    semaphore,
-    config,
-):
-    returnData = {
-        "name": site["name"],
-        "url": url,
-        "category": site["cat"],
-        "status": "NONE",
-        "metadata": None,
-    }
-    extractedMetadata = []
-
-    async with semaphore:
-        response = await do_async_request(method, url, session, config)
-        if response == None:
-            returnData["status"] = "ERROR"
-            return returnData
+async def checkSite(site, url, session, sem, cfg, q):
+    """Unified isolated fault-walled target validation network pipeline."""
+    res = {"name": site["name"], "url": url, "category": site["cat"], "status": "NONE", "metadata": None}
+    if not url: return {**res, "status": "MALFORMED"}
+    
+    async with sem:
+        resp = await asyncio.shield(do_async_request("GET", url, session, cfg))
+        if not resp: return {**res, "status": "NET-ERROR"}
+        
         try:
-            if response:
-                if (site["e_string"] in response["content"]) and (
-                    site["e_code"] == response["status_code"]
-                ):
-                    if (site["m_string"] not in response["content"]) and (
-                        (site["m_code"] != response["status_code"])
-                        if site["m_code"] != site["e_code"]
-                        else True
-                    ):
-                        returnData["status"] = "FOUND"
-                        config.console.print(
-                            rf"  ✔️  \[[cyan1]{site['name']}[/cyan1]] [bright_white]{response['url']}[/bright_white]"
-                        )
-
-                        if site["name"] in config.metadata_params["sites"]:
-                            metadata = extractMetadata(
-                                config.metadata_params["sites"][site["name"]],
-                                response,
-                                site["name"],
-                                config,
-                            )
-                            extractedMetadata.extend(metadata)
-
-                        if config.ai and config.aiModel:
-                            metadata = extract_data_with_ai(
-                                config, site, response["content"], response["json"]
-                            )
-                            extractedMetadata.extend(metadata)
-
-                        if site["name"] == "Instagram":
-                            if config.instagram_session_id:
-                                metadata = get_instagram_account_info(
-                                    config.currentUser,
-                                    config.instagram_session_id,
-                                    config,
-                                )
-                                extractedMetadata.sort(key=lambda x: x["name"])
-                                extractedMetadata.extend(metadata)
-
-                        if extractedMetadata and len(extractedMetadata) > 0:
-                            extractedMetadata = remove_duplicates(extractedMetadata)
-                            extractedMetadata.sort(key=lambda x: x["name"])
-                            returnData["metadata"] = extractedMetadata
-
-                        # Save response content to a .HTML file
-                        if config.dump:
-                            path = os.path.join(
-                                config.saveDirectory, f"dump_{config.currentUser}"
-                            )
-
-                            result = dumpContent(path, site, response, config)
-                            if result == True and config.verbose:
-                                config.console.print(
-                                    f"      💾  Saved HTML data from found account"
-                                )
-                else:
-                    returnData["status"] = "NOT-FOUND"
-                    if config.verbose:
-                        config.console.print(
-                            f"  ❌ [[blue]{site['name']}[/blue]] [bright_white]{response['url']}[/bright_white]"
-                        )
-                return returnData
+            hit = (site["e_string"] in resp["content"]) and (site["e_code"] == resp["status_code"])
+            m_str, m_code = site.get("m_string"), site.get("m_code")
+            is_m = (m_str not in resp["content"]) and (m_code != resp["status_code"]) if (m_str and m_code) else True
+            
+            if hit and is_m:
+                cfg.console.print(f" ✔️  [[cyan1]{escape(site['name'])}[/cyan1]] [bright_white]{resp.get('url', url)}[/]")
+                meta = []
+                
+                # Multi-Source Metadata Unpacking Array Matrix
+                reg = getattr(cfg, "metadata_params", {}).get("sites", {})
+                if site["name"] in reg: meta.extend(extractMetadata(reg[site["name"]], resp, site["name"], cfg) or [])
+                if getattr(cfg, "ai", 0) and getattr(cfg, "aiModel", 0):
+                    try: meta.extend(__import__('..utils.ai_processing', fromlist=['ex']).ex(cfg, site, resp["content"], resp["json"]) or [])
+                    except Exception: pass
+                if site["name"] == "Instagram" and getattr(cfg, "instagram_session_id", None):
+                    meta.extend(get_instagram_account_info(q, cfg.instagram_session_id, cfg) or [])
+                    
+                if meta:
+                    meta = remove_duplicates(meta)
+                    meta.sort(key=lambda x: x.get("name", "").lower())
+                    res["metadata"] = meta
+                
+                if cfg.dump: dumpContent(os.path.join(getattr(cfg, "saveDirectory", "logs"), f"dump_{q}"), site, resp, cfg)
+                return {**res, "status": "FOUND"}
+            
+            if cfg.verbose: cfg.console.print(f" ❌ [[blue]{escape(site['name'])}[/blue]] [bright_white]{resp.get('url', url)}[/]")
+            return {**res, "status": "NOT-FOUND"}
         except Exception as e:
-            logError(e, f"Coudn't check {site['name']} {url}", config)
-            return returnData
+            logError(e, f"Crash: {site['name']}", cfg)
+            return {**res, "status": "CRASH"}
 
+async def search(q, cfg):
+    """Highly optimized parallel target worker orchestration block."""
+    sites, done, out = getattr(cfg, "username_sites", []), 0, []
+    if not sites: return {"results": [], "username": q}
+    
+    sem = asyncio.Semaphore(cfg.max_concurrent_requests)
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=getattr(cfg, "timeout", 30))) as sess:
+        async def wrap(s):
+            nonlocal done
+            r = await checkSite(s, s["uri_check"].replace("{account}", q), sess, sem, cfg, q)
+            done += 1
+            live.update(Text.from_markup(f"  Scanning: [cyan1]\"{escape(q)}\"[/] — [green]{int((done/len(sites))*100)}%[/] ({done}/{len(sites)})"))
+            return r
+            
+        with Live(Text("  Starting..."), refresh_per_second=10, console=cfg.console) as live:
+            out = await asyncio.gather(*[wrap(s) for s in sites], return_exceptions=True)
+    return {"results": [r for r in out if isinstance(r, dict)], "username": q}
 
-from rich.live import Live
-from rich.console import Group
-from rich.text import Text
-
-async def fetchResults(username, config):
-    async with aiohttp.ClientSession() as session:
-        semaphore = asyncio.Semaphore(config.max_concurrent_requests)
-        total_sites = len(config.username_sites)
-        completed = 0
-        results = []
-
-        def render():
-            percent = int((completed / total_sites) * 100)
-            return Text.from_markup(
-                f"🛰️  Enumerating accounts with username [cyan1]\"{username}\"[/cyan1] — [green1]{percent}%[/green1] ({completed}/{total_sites})"
-            )
-
-        async def wrappedCheck(site):
-            nonlocal completed
-            result = await checkSite(
-                site=site,
-                method="GET",
-                url=site["uri_check"].replace("{account}", username),
-                session=session,
-                semaphore=semaphore,
-                config=config,
-            )
-            completed += 1
-            return result
-
-        tasks = [wrappedCheck(site) for site in config.username_sites]
-
-        with Live(render(), refresh_per_second=10, console=config.console) as live:
-            for coro in asyncio.as_completed(tasks):
-                result = await coro
-                results.append(result)
-                live.update(render())
-
-        return {"results": results, "username": username}
-
-
-
-
-# Start username check and presents results to user
 def verifyUsername(username, config, sitesToSearch=None, metadata_params=None):
-    if sitesToSearch is None or metadata_params is None:
-        data = readList("username", config)
-        sitesToSearch = data["sites"]
-        config.metadata_params = readList("metadata", config)
-    else:
-        config.metadata_params = metadata_params
-
+    """Device-agnostic operational entrypoint bridging execution layers."""
+    if None in (sitesToSearch, metadata_params):
+        raw = readList("username", config)
+        sitesToSearch, config.metadata_params = raw.get("sites", []), readList("metadata", config)
+    else: config.metadata_params = metadata_params
+    
     config.username_sites = applyFilters(sitesToSearch, config)
-
-    start_time = time.time()
-    results = asyncio.run(fetchResults(username, config))
-    end_time = time.time()
-
-    config.console.print(
-        f":chequered_flag: Check completed in {round(end_time - start_time, 1)} seconds"
-    )
-
-    if config.dump:
-        config.console.print(
-            f"💾  Dump content saved to '[cyan1]{config.currentUser}_{config.dateRaw}_blackbird/dump_{config.currentUser}[/cyan1]'"
-        )
-
-    # Filter results to only found accounts
-    foundAccounts = list(filter(filterFoundAccounts, results["results"]))
-    config.usernameFoundAccounts = foundAccounts
-    if len(foundAccounts) <= 0:
-        config.console.print("⭕ No accounts were found for the given username")
-
-    return foundAccounts
+    if not config.username_sites: return config.console.print("[p] No operational matches.[/]") or []
+    
+    config.currentUser, start = username, time.time()
+    try: loop = asyncio.get_running_loop()
+    except RuntimeError: loop = None
+    
+    res = loop.run_until_complete(search(username, config)) if loop and loop.is_running() else asyncio.run(search(username, config))
+    config.console.print(f" Done in {round(time.time() - start, 1)}s.")
+    
+    config.usernameFoundAccounts = list(filter(filterFoundAccounts, res.get("results", [])))
+    if not config.usernameFoundAccounts: config.console.print("⭕ No identity footprints found.")
+    return config.usernameFoundAccounts
